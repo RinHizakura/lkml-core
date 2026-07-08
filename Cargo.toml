@@ -1,0 +1,16 @@
+[package]
+name = "lkml-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "Mail parsing and archive access for lore.kernel.org public-inbox lists."
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip"] }
+flate2 = "1"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
