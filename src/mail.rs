@@ -88,7 +88,7 @@ impl Mail {
     /// Render the mail as plain text: a fixed set of headers followed by the
     /// decoded body. Used by the reader's detail view and the digest full format.
     pub fn render_full(&self) -> String {
-        let (headers, body) = split_headers(&self.raw);
+        let (headers, _) = split_headers(&self.raw);
 
         let mut out = String::new();
         for field in ["From", "Date", "Subject", "To", "Cc", "Message-ID"] {
@@ -100,14 +100,63 @@ impl Mail {
             }
         }
         out.push_str("\n--\n\n");
+        out.push_str(&self.body());
+        out
+    }
 
+    /// The body, decoded according to `Content-Transfer-Encoding`.
+    fn body(&self) -> String {
+        let (headers, body) = split_headers(&self.raw);
         let encoding = parse_header(headers, "Content-Transfer-Encoding")
             .unwrap_or_default()
             .to_ascii_lowercase();
         if encoding.trim() == "quoted-printable" {
-            out.push_str(&decode_quoted_printable(body));
+            decode_quoted_printable(body)
         } else {
-            out.push_str(body);
+            body.to_string()
+        }
+    }
+
+    /// An mbox draft of a reply to this mail: the sender becomes `To`, the
+    /// original `To`/`Cc` become `Cc`, `In-Reply-To` threads it, and the body is
+    /// quoted under an attribution line.
+    ///
+    /// `From` and `Message-ID` are deliberately absent: whoever sends the draft
+    /// (`git send-email`) fills them in from the user's own identity, so no
+    /// account information has to pass through here.
+    pub fn reply_draft(&self) -> String {
+        let subject = if self.subject.to_ascii_lowercase().starts_with("re:") {
+            self.subject.clone()
+        } else {
+            format!("Re: {}", self.subject)
+        };
+        let (headers, _) = split_headers(&self.raw);
+        let orig_cc = parse_header(headers, "Cc")
+            .map(|s| decode_mime_header(&s))
+            .unwrap_or_default();
+        let cc = [self.to.as_str(), orig_cc.as_str()]
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut out = format!("Subject: {subject}\nTo: {}\n", self.from);
+        if !cc.is_empty() {
+            out.push_str(&format!("Cc: {cc}\n"));
+        }
+        if !self.message_id.is_empty() {
+            out.push_str(&format!("In-Reply-To: {}\n", self.message_id));
+        }
+        out.push_str(&format!(
+            "\nOn {}, {} wrote:\n\n",
+            self.date_str(),
+            self.author()
+        ));
+        for line in self.body().lines() {
+            out.push_str(if line.is_empty() { ">" } else { "> " });
+            out.push_str(line);
+            out.push('\n');
         }
         out
     }
