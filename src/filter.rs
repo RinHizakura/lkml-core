@@ -32,16 +32,30 @@ impl fmt::Display for DateRange {
     }
 }
 
-/// Subject-substring constraint. Empty (`None`) means "no constraint" — every
-/// subject matches.
-#[derive(Clone, Debug, Default)]
-pub struct SubjectFilter {
+/// Case-insensitive substring constraint over one of the mail's text headers.
+/// Subject and author differ only in which header they read.
+#[derive(Clone, Debug)]
+pub struct NameFilter {
     pub needle: Option<String>,
+    field: fn(&Mail) -> &str,
 }
 
-impl SubjectFilter {
-    pub fn new() -> Self {
-        Self { needle: None }
+impl NameFilter {
+    /// Match against the mail's `Subject`.
+    pub fn subject() -> Self {
+        Self {
+            needle: None,
+            field: |mail| &mail.subject,
+        }
+    }
+
+    /// Match against the whole decoded `From` header, so both the display name
+    /// and the address are searchable.
+    pub fn author() -> Self {
+        Self {
+            needle: None,
+            field: |mail| &mail.from,
+        }
     }
 
     /// Replace the needle from raw user text. Empty text clears the filter.
@@ -55,7 +69,7 @@ impl SubjectFilter {
     }
 }
 
-impl Filter for SubjectFilter {
+impl Filter for NameFilter {
     fn is_active(&self) -> bool {
         self.needle.is_some()
     }
@@ -63,12 +77,12 @@ impl Filter for SubjectFilter {
     fn matches(&self, mail: &Mail) -> bool {
         match &self.needle {
             None => true,
-            Some(n) => mail.subject.to_lowercase().contains(&n.to_lowercase()),
+            Some(n) => (self.field)(mail).to_lowercase().contains(&n.to_lowercase()),
         }
     }
 }
 
-impl fmt::Display for SubjectFilter {
+impl fmt::Display for NameFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.needle {
             None => f.write_str("(none)"),
