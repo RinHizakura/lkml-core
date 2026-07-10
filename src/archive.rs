@@ -218,13 +218,35 @@ pub fn ensure_epoch_by_time(list: &str, window_start: DateTime<Utc>) -> Result<V
 /// one — without reading any mail bodies. (git-log's natural order is the
 /// archival/committer date, which can shuffle a batch received in one second.)
 pub fn list_all_commits(list: &str, epoch: u32) -> Result<Vec<String>> {
+    search_commits(list, epoch, None, None)
+}
+
+/// Commits whose mail matches the given subject and/or author substrings.
+/// Both needles are case-insensitive fixed strings, and are ANDed when
+/// both are given.
+pub fn search_commits(
+    list: &str,
+    epoch: u32,
+    subject: Option<&str>,
+    author: Option<&str>,
+) -> Result<Vec<String>> {
     let git_dir = local_repo_path(list, epoch);
-    let out = Command::new("git")
-        .arg(format!("--git-dir={}", git_dir.display()))
+    let mut cmd = Command::new("git");
+    cmd.arg(format!("--git-dir={}", git_dir.display()))
         .arg("log")
-        .arg("--pretty=format:%H %at")
-        .output()
-        .context("running git log")?;
+        .arg("--pretty=format:%H %at");
+    if subject.is_some() || author.is_some() {
+        // Fixed strings, case-insensitive: same semantics as a lowercased
+        // `contains` over the header.
+        cmd.arg("--fixed-strings").arg("--regexp-ignore-case");
+    }
+    if let Some(needle) = subject {
+        cmd.arg(format!("--grep={needle}"));
+    }
+    if let Some(needle) = author {
+        cmd.arg(format!("--author={needle}"));
+    }
+    let out = cmd.output().context("running git log")?;
     if !out.status.success() {
         bail!(
             "git log failed: {}",
