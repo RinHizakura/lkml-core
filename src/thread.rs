@@ -30,12 +30,17 @@ impl Threaded for Mail {
 }
 
 /// Every patch of `sel`'s series, ordered 1/m, 2/m, …, wherever the mails sit
-/// in the archive.
+/// in the archive. Empty when `sel` is not a patch mail.
 ///
-/// The thread root (the head of `References`, or the mail itself when it *is*
-/// the root) identifies the series: every mail in the mirror that names that
-/// root and carries a `[PATCH n/m]` subject is a member.
+/// A mail belongs to the series when it shares `sel`'s revision *and* series
+/// length *and* thread, and carries a real `[PATCH n/m]` (not the `0/m` cover).
+/// All three matter: the same thread often holds several revisions of a series,
+/// and a bare `[PATCH]` fixup posted as a reply would otherwise pose as `1/1`
+/// and shoulder out the real first patch.
 pub fn patch_series(list: &str, sel: &Mail) -> Result<Vec<Mail>> {
+    let Some(sel_tag) = sel.patch_tag.filter(|t| t.number > 0) else {
+        return Ok(Vec::new());
+    };
     let root = normalize_message_id(sel.references.first().unwrap_or(&sel.message_id));
 
     // Let git log prune the epoch before any mail is read.
@@ -50,20 +55,22 @@ pub fn patch_series(list: &str, sel: &Mail) -> Result<Vec<Mail>> {
         let Ok(mail) = mail::fetch(list, sel.epoch, &commit) else {
             continue;
         };
-        let Some((n, _)) = mail.patch_nums else {
+        let Some(tag) = mail.patch_tag else {
             continue;
         };
-        if n == 0 || !references_root(&mail, &root) {
+        if tag.number == 0
+            || tag.version != sel_tag.version
+            || tag.total != sel_tag.total
+            || !references_root(&mail, &root)
+        {
             continue;
         }
         // search_commits answers newest-first, so a resend beats the original.
-        series.entry(n).or_insert(mail);
+        series.entry(tag.number).or_insert(mail);
     }
     // The selected mail is ground truth: keep it even when the pre-filter missed
     // it (an oddly spelled From, say).
-    if let Some((n, _)) = sel.patch_nums.filter(|(n, _)| *n > 0) {
-        series.entry(n).or_insert_with(|| sel.clone());
-    }
+    series.entry(sel_tag.number).or_insert_with(|| sel.clone());
 
     // Keys are the patch numbers, so this comes out in apply order.
     Ok(series.into_values().collect())

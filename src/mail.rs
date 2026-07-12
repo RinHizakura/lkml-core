@@ -27,12 +27,25 @@ pub struct Mail {
     /// The whole `References` chain, oldest first. Its head names the thread
     /// root — the cover letter of a patch series.
     pub references: Vec<String>,
-    /// `(n, m)` of a `[PATCH ... n/m ...]` subject: a cover letter is `0/m`, a
-    /// lone `[PATCH]` is `1/1`. `None` when this is not a patch mail at all — a
-    /// review reply, or ordinary discussion.
-    pub patch_nums: Option<(u32, u32)>,
+    /// The decoded `[PATCH ...]` subject tag, or `None` when this is not a patch
+    /// mail — a review reply, or ordinary discussion.
+    pub patch_tag: Option<PatchTag>,
     pub epoch: u32,
     pub commit: String,
+}
+
+/// The `vV n/m` decoded from a `[PATCH ...]` subject tag. Two mails belong to
+/// the same series iff they share a `version` and `total` (and a thread); the
+/// `number` orders them and singles out the `0/m` cover letter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PatchTag {
+    /// Revision: `[PATCH v2 ...]` → 2, an untagged `[PATCH ...]` → 1.
+    pub version: u32,
+    /// This patch's position, the `n` of `n/m`. A cover letter is 0, a lone
+    /// `[PATCH]` is 1.
+    pub number: u32,
+    /// The series length, the `m` of `n/m`. A lone `[PATCH]` is 1.
+    pub total: u32,
 }
 
 /// Fetch and parse the mail at `commit` from the local mirror of `list`'s
@@ -68,7 +81,7 @@ impl Mail {
         let date = parse_header(headers, "Date").and_then(|s| parse_rfc_date(&s));
         let author = pretty_from(&from);
         let sender = parse_sender(&from);
-        let patch_nums = parse_patch_nums(&subject);
+        let patch_tag = parse_patch_tag(&subject);
         Mail {
             raw,
             subject,
@@ -80,7 +93,7 @@ impl Mail {
             message_id,
             in_reply_to,
             references,
-            patch_nums,
+            patch_tag,
             epoch,
             commit,
         }
@@ -182,8 +195,10 @@ fn parse_sender(from: &str) -> String {
     }
 }
 
-/// `(n, m)` out of a `[PATCH ... n/m ...]` subject; see [`Mail::patch_nums`].
-fn parse_patch_nums(subject: &str) -> Option<(u32, u32)> {
+/// Decode a `[PATCH vV n/m ...]` subject tag; see [`PatchTag`]. `vV` and `n/m`
+/// are both optional (a lone `[PATCH]` is v1, 1/1); anything the words don't
+/// supply keeps that default.
+fn parse_patch_tag(subject: &str) -> Option<PatchTag> {
     let subject = subject.trim();
     if subject.to_ascii_lowercase().starts_with("re:") {
         return None;
@@ -192,13 +207,26 @@ fn parse_patch_nums(subject: &str) -> Option<(u32, u32)> {
     if !tag.to_ascii_uppercase().contains("PATCH") {
         return None;
     }
-    // Both sides have to be numbers: a tag like "[PATCH net/tcp]" carries a
-    // slash but no series numbering.
-    let nums = tag.split_whitespace().find_map(|w| {
-        let (n, m) = w.split_once('/')?;
-        Some((n.parse::<u32>().ok()?, m.parse::<u32>().ok()?))
-    });
-    Some(nums.unwrap_or((1, 1)))
+    let mut out = PatchTag {
+        version: 1,
+        number: 1,
+        total: 1,
+    };
+    for w in tag.split_whitespace() {
+        // "v2" -> revision 2. Only a bare v-then-digits word, so "vfs" and
+        // "PATCH" fall through.
+        if let Some(v) = w.strip_prefix(['v', 'V']).and_then(|d| d.parse::<u32>().ok()) {
+            out.version = v;
+        } else if let Some((n, m)) = w.split_once('/') {
+            // Both sides must be numbers: "[PATCH net/tcp]" has a slash but no
+            // series numbering.
+            if let (Ok(n), Ok(m)) = (n.parse::<u32>(), m.parse::<u32>()) {
+                out.number = n;
+                out.total = m;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// A display name from a `From` header: the quoted/plain name if present,
