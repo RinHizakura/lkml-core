@@ -191,7 +191,14 @@ impl Mail {
 fn parse_sender(from: &str) -> String {
     match (from.find('<'), from.find('>')) {
         (Some(a), Some(b)) if a < b => from[a + 1..b].to_string(),
-        _ => from.trim().to_string(),
+        // Comment form "addr@host (Name)" has no angle brackets; the address is
+        // the first word that looks like one. Falls back to the whole header.
+        _ => from
+            .split_whitespace()
+            .find(|w| w.contains('@'))
+            .map(|w| w.trim_matches(['(', ')']))
+            .unwrap_or_else(|| from.trim())
+            .to_string(),
     }
 }
 
@@ -203,16 +210,24 @@ fn parse_patch_tag(subject: &str) -> Option<PatchTag> {
     if subject.to_ascii_lowercase().starts_with("re:") {
         return None;
     }
-    let tag = subject.strip_prefix('[')?.split_once(']')?.0;
-    if !tag.to_ascii_uppercase().contains("PATCH") {
-        return None;
-    }
+    // Consume leading "[...]" groups so a routing prefix like
+    // "[for-next][PATCH 05/10]" or "[RFC][PATCH 2/5]" still reaches the tag.
+    let mut rest = subject;
+    let group = loop {
+        let (group, tail) = rest.strip_prefix('[')?.split_once(']')?;
+        if group.to_ascii_uppercase().contains("PATCH") {
+            break group;
+        }
+        rest = tail.trim_start();
+    };
     let mut out = PatchTag {
         version: 1,
         number: 1,
         total: 1,
     };
-    for w in tag.split_whitespace() {
+    // A comma sometimes glues fields together ("v9,0/7", "1/3, v2"); treat it as
+    // a separator so each field is its own word.
+    for w in group.replace(',', " ").split_whitespace() {
         // "v2" -> revision 2. Only a bare v-then-digits word, so "vfs" and
         // "PATCH" fall through.
         if let Some(v) = w.strip_prefix(['v', 'V']).and_then(|d| d.parse::<u32>().ok()) {
