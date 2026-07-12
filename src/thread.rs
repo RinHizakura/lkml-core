@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 
 //! Reply-thread math over a set of mails: given each mail's own Message-ID and
-//! the id it replies to, size the reply subtree rooted at each one.
+//! the id it replies to, size the reply subtree rooted at each one. Also where
+//! a patch series is pulled back out of the archive, since a series is just the
+//! patch mails of one thread.
 
-use std::collections::HashMap;
+use anyhow::{Context, Result};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::mail::Mail;
+use crate::archive;
+use crate::mail::{self, Mail};
 use crate::parse::normalize_message_id;
 
 /// Anything that can sit in a reply tree: it knows its own id and its parent's.
@@ -23,6 +27,54 @@ impl Threaded for Mail {
     fn in_reply_to(&self) -> &str {
         &self.in_reply_to
     }
+}
+
+/// Every patch of `sel`'s series, ordered 1/m, 2/m, …, wherever the mails sit
+/// in the archive.
+///
+/// The thread root (the head of `References`, or the mail itself when it *is*
+/// the root) identifies the series: every mail in the mirror that names that
+/// root and carries a `[PATCH n/m]` subject is a member.
+pub fn patch_series(list: &str, sel: &Mail) -> Result<Vec<Mail>> {
+    let root = normalize_message_id(sel.references.first().unwrap_or(&sel.message_id));
+
+    // Let git log prune the epoch before any mail is read.
+    // TODO: only the selected mail's epoch is searched, and only that
+    // sender's mails — a series straddling an epoch boundary, or one resent
+    // under a different From spelling, loses the stragglers.
+    let commits = archive::search_commits(list, sel.epoch, Some("PATCH"), Some(&sel.sender))
+        .context("searching the mirror for the rest of the series")?;
+
+    let mut series: BTreeMap<u32, Mail> = BTreeMap::new();
+    for commit in commits {
+        let Ok(mail) = mail::fetch(list, sel.epoch, &commit) else {
+            continue;
+        };
+        let Some((n, _)) = mail.patch_nums else {
+            continue;
+        };
+        if n == 0 || !references_root(&mail, &root) {
+            continue;
+        }
+        // search_commits answers newest-first, so a resend beats the original.
+        series.entry(n).or_insert(mail);
+    }
+    // The selected mail is ground truth: keep it even when the pre-filter missed
+    // it (an oddly spelled From, say).
+    if let Some((n, _)) = sel.patch_nums.filter(|(n, _)| *n > 0) {
+        series.entry(n).or_insert_with(|| sel.clone());
+    }
+
+    // Keys are the patch numbers, so this comes out in apply order.
+    Ok(series.into_values().collect())
+}
+
+fn references_root(mail: &Mail, root: &str) -> bool {
+    normalize_message_id(&mail.message_id) == root
+        || mail
+            .references
+            .iter()
+            .any(|r| normalize_message_id(r) == root)
 }
 
 /// For each item, the number of items in the set that reply to it transitively

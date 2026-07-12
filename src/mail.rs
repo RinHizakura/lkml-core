@@ -13,15 +13,24 @@ use crate::archive;
 #[derive(Debug, Clone, Default)]
 pub struct Mail {
     /// The raw mail text, kept so the body can be rendered on demand.
-    raw: String,
+    pub raw: String,
     pub subject: String,
     pub from: String,
+    pub author: String,
+    pub sender: String,
     pub to: String,
     pub date: Option<DateTime<FixedOffset>>,
     pub message_id: String,
     /// The mail this one replies to: `In-Reply-To`, or the last id in
     /// `References` when `In-Reply-To` is absent. Empty for thread roots.
     pub in_reply_to: String,
+    /// The whole `References` chain, oldest first. Its head names the thread
+    /// root — the cover letter of a patch series.
+    pub references: Vec<String>,
+    /// `(n, m)` of a `[PATCH ... n/m ...]` subject: a cover letter is `0/m`, a
+    /// lone `[PATCH]` is `1/1`. `None` when this is not a patch mail at all — a
+    /// review reply, or ordinary discussion.
+    pub patch_nums: Option<(u32, u32)>,
     pub epoch: u32,
     pub commit: String,
 }
@@ -49,30 +58,32 @@ impl Mail {
             .map(|s| decode_mime_header(&s))
             .unwrap_or_default();
         let message_id = parse_header(headers, "Message-ID").unwrap_or_default();
+        let references: Vec<String> = parse_header(headers, "References")
+            .map(|r| r.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default();
         // Prefer In-Reply-To; fall back to the last id in References.
         let in_reply_to = parse_header(headers, "In-Reply-To")
-            .or_else(|| {
-                parse_header(headers, "References")
-                    .and_then(|r| r.split_whitespace().last().map(str::to_string))
-            })
+            .or_else(|| references.last().cloned())
             .unwrap_or_default();
         let date = parse_header(headers, "Date").and_then(|s| parse_rfc_date(&s));
+        let author = pretty_from(&from);
+        let sender = parse_sender(&from);
+        let patch_nums = parse_patch_nums(&subject);
         Mail {
             raw,
             subject,
             from,
+            author,
+            sender,
             to,
             date,
             message_id,
             in_reply_to,
+            references,
+            patch_nums,
             epoch,
             commit,
         }
-    }
-
-    /// A display name for the sender, stripped of the angle-bracket address.
-    pub fn author(&self) -> String {
-        pretty_from(&self.from)
     }
 
     /// The `Date` header formatted for display in the local timezone, or `-`
@@ -151,7 +162,7 @@ impl Mail {
         out.push_str(&format!(
             "\nOn {}, {} wrote:\n\n",
             self.date_str(),
-            self.author()
+            self.author
         ));
         for line in self.body().lines() {
             out.push_str(if line.is_empty() { ">" } else { "> " });
@@ -160,6 +171,34 @@ impl Mail {
         }
         out
     }
+}
+
+/// The bare address out of a `Name <addr@host>` From header, falling back to the
+/// whole header when it carries no angle brackets.
+fn parse_sender(from: &str) -> String {
+    match (from.find('<'), from.find('>')) {
+        (Some(a), Some(b)) if a < b => from[a + 1..b].to_string(),
+        _ => from.trim().to_string(),
+    }
+}
+
+/// `(n, m)` out of a `[PATCH ... n/m ...]` subject; see [`Mail::patch_nums`].
+fn parse_patch_nums(subject: &str) -> Option<(u32, u32)> {
+    let subject = subject.trim();
+    if subject.to_ascii_lowercase().starts_with("re:") {
+        return None;
+    }
+    let tag = subject.strip_prefix('[')?.split_once(']')?.0;
+    if !tag.to_ascii_uppercase().contains("PATCH") {
+        return None;
+    }
+    // Both sides have to be numbers: a tag like "[PATCH net/tcp]" carries a
+    // slash but no series numbering.
+    let nums = tag.split_whitespace().find_map(|w| {
+        let (n, m) = w.split_once('/')?;
+        Some((n.parse::<u32>().ok()?, m.parse::<u32>().ok()?))
+    });
+    Some(nums.unwrap_or((1, 1)))
 }
 
 /// A display name from a `From` header: the quoted/plain name if present,
