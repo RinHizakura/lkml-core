@@ -12,6 +12,33 @@ use crate::archive;
 use crate::mail::{self, Mail};
 use crate::parse::normalize_message_id;
 
+/// What identifies the series a patch belongs to: the thread it hangs off, plus
+/// the revision and length of its `[PATCH vV n/m]` tag. Two mails are siblings
+/// iff their [`SeriesTag`]s are equal.
+///
+/// This is [`PatchTag`](crate::mail::PatchTag) minus `number` — which is what
+/// tells siblings apart — plus the thread root, since one thread often carries
+/// several revisions of a series.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SeriesTag {
+    /// The thread root's Message-ID: the cover letter of the series.
+    pub root: String,
+    pub version: u32,
+    pub total: u32,
+}
+
+/// The series `mail` belongs to, or `None` when it is not part of a multi-patch
+/// series — ordinary mail, a review reply, or a lone `[PATCH]`.
+pub fn series_tag(mail: &Mail) -> Option<SeriesTag> {
+    let tag = mail.patch_tag.filter(|t| t.total > 1)?;
+    Some(SeriesTag {
+        // A cover letter has no References and is its own root.
+        root: normalize_message_id(mail.references.first().unwrap_or(&mail.message_id)),
+        version: tag.version,
+        total: tag.total,
+    })
+}
+
 /// Anything that can sit in a reply tree: it knows its own id and its parent's.
 /// Implemented for [`Mail`]; apps can implement it for their own wrapper types
 /// so [`reply_counts`] works without copying mails out of them.
