@@ -309,6 +309,14 @@ fn parse_rfc_date(s: &str) -> Option<DateTime<FixedOffset>> {
         .or_else(|| DateTime::parse_from_rfc3339(s).ok())
 }
 
+/// The byte behind the `=XX` escape starting at `i`, or `None` when the two hex
+/// digits are not both there — a bare `=` that the sender never escaped.
+fn hex_escape(bytes: &[u8], i: usize) -> Option<u8> {
+    let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
+    let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
+    Some(((hi << 4) | lo) as u8)
+}
+
 /// Decode an RFC 2045 quoted-printable body: join soft line breaks
 /// (`=` followed by CRLF or LF) and decode `=XX` hex escapes.
 fn decode_quoted_printable(s: &str) -> String {
@@ -321,25 +329,18 @@ fn decode_quoted_printable(s: &str) -> String {
             i += 1;
             continue;
         }
-        if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+        // A soft line break: "=\n" or "=\r\n", both dropped.
+        if bytes.get(i + 1) == Some(&b'\n') {
             i += 2;
-            continue;
-        }
-        if i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+        } else if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
             i += 3;
-            continue;
+        } else if let Some(byte) = hex_escape(bytes, i) {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(b'=');
+            i += 1;
         }
-        if i + 2 < bytes.len() {
-            let h1 = (bytes[i + 1] as char).to_digit(16);
-            let h2 = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(a), Some(b)) = (h1, h2) {
-                out.push(((a << 4) | b) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b'=');
-        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -425,6 +426,8 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decode an RFC 2047 `Q` encoded-word: like quoted-printable, but `_` stands
+/// for a space and there are no soft line breaks to join.
 fn decode_q(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -435,17 +438,16 @@ fn decode_q(s: &str) -> Vec<u8> {
                 out.push(b' ');
                 i += 1;
             }
-            b'=' if i + 2 < bytes.len() => {
-                let h1 = (bytes[i + 1] as char).to_digit(16);
-                let h2 = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(a), Some(b)) = (h1, h2) {
-                    out.push(((a << 4) | b) as u8);
+            b'=' => match hex_escape(bytes, i) {
+                Some(byte) => {
+                    out.push(byte);
                     i += 3;
-                } else {
+                }
+                None => {
                     out.push(b'=');
                     i += 1;
                 }
-            }
+            },
             c => {
                 out.push(c);
                 i += 1;
