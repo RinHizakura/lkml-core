@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
+use std::cmp::Reverse;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
@@ -35,12 +36,8 @@ fn local_repo_path(list: &str, epoch: u32) -> PathBuf {
     archive_root().join(format!("{list}/{epoch}.git"))
 }
 
-fn manifest_url() -> String {
-    format!("{BASE}/manifest.js.gz")
-}
-
 fn fetch_manifest(client: &reqwest::blocking::Client) -> Result<String> {
-    let url = manifest_url();
+    let url = format!("{BASE}/manifest.js.gz");
     let resp = client
         .get(&url)
         .send()
@@ -97,24 +94,29 @@ pub fn repo_exists(list: &str, epoch: u32) -> bool {
     local_repo_path(list, epoch).exists()
 }
 
-fn update_mirror(list: &str, epoch: u32) -> Result<()> {
+/// Run git against the local mirror of `list`'s `epoch` and hand back its
+/// stdout. Every read of a mirror goes through here, so they all fail the same
+/// way: a non-zero exit becomes an error carrying git's own stderr. (Cloning is
+/// the exception — there is no mirror to point `--git-dir` at yet.)
+fn git(list: &str, epoch: u32, args: &[&str]) -> Result<String> {
     let dir = local_repo_path(list, epoch);
-    if !dir.is_dir() {
-        bail!("mirror not present: {}", dir.display());
-    }
     let out = Command::new("git")
         .arg(format!("--git-dir={}", dir.display()))
-        .arg("remote")
-        .arg("update")
+        .args(args)
         .output()
-        .context("running git remote update")?;
+        .with_context(|| format!("running git {}", args.join(" ")))?;
     if !out.status.success() {
         bail!(
-            "git remote update failed: {}",
+            "git {} failed: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn update_mirror(list: &str, epoch: u32) -> Result<()> {
+    git(list, epoch, &["remote", "update"]).map(drop)
 }
 
 fn clone_mirror(list: &str, epoch: u32) -> Result<()> {
@@ -164,17 +166,7 @@ pub fn ensure_epoch(list: &str, epoch: u32) -> Result<()> {
 /// before this epoch's coverage — if this date is at or before the window
 /// start, the epoch covers the start and no earlier epoch is needed.
 pub fn epoch_start_date(list: &str, epoch: u32) -> Result<Option<DateTime<Utc>>> {
-    let git_dir = local_repo_path(list, epoch);
-    let out = Command::new("git")
-        .arg(format!("--git-dir={}", git_dir.display()))
-        .arg("log")
-        .arg("--pretty=format:%ct")
-        .output()
-        .context("running git log for epoch start date")?;
-    if !out.status.success() {
-        bail!("git log failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    let min = String::from_utf8_lossy(&out.stdout)
+    let min = git(list, epoch, &["log", "--pretty=format:%ct"])?
         .lines()
         .filter_map(|l| l.trim().parse::<i64>().ok())
         .min();
@@ -230,27 +222,17 @@ pub fn search_commits(
     subject: Option<&str>,
     author: Option<&str>,
 ) -> Result<Vec<String>> {
-    let git_dir = local_repo_path(list, epoch);
-    let mut cmd = Command::new("git");
-    cmd.arg(format!("--git-dir={}", git_dir.display()))
-        .arg("log")
-        .arg("--pretty=format:%H %at");
-    if subject.is_some() || author.is_some() {
+    let grep = subject.map(|needle| format!("--grep={needle}"));
+    let author = author.map(|needle| format!("--author={needle}"));
+    let mut args = vec!["log", "--pretty=format:%H %at"];
+    if grep.is_some() || author.is_some() {
         // Fixed strings, case-insensitive: same semantics as a lowercased
         // `contains` over the header.
-        cmd.arg("--fixed-strings").arg("--regexp-ignore-case");
+        args.extend(["--fixed-strings", "--regexp-ignore-case"]);
     }
-    if let Some(needle) = subject {
-        cmd.arg(format!("--grep={needle}"));
-    }
-    if let Some(needle) = author {
-        cmd.arg(format!("--author={needle}"));
-    }
-    let out = cmd.output().context("running git log")?;
-    if !out.status.success() {
-        bail!("git log failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    let mut rows: Vec<(i64, String)> = String::from_utf8_lossy(&out.stdout)
+    args.extend(grep.iter().chain(author.iter()).map(String::as_str));
+
+    let mut rows: Vec<(i64, String)> = git(list, epoch, &args)?
         .lines()
         .filter_map(|l| {
             let (hash, ts) = l.split_once(' ')?;
@@ -258,7 +240,7 @@ pub fn search_commits(
         })
         .collect();
     // Newest author-date (mail Date) first.
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|&(ts, _)| Reverse(ts));
     Ok(rows.into_iter().map(|(_, hash)| hash).collect())
 }
 
@@ -270,22 +252,8 @@ pub fn list_commits_since(
     epoch: u32,
     since: DateTime<chrono::Utc>,
 ) -> Result<Vec<String>> {
-    let git_dir = local_repo_path(list, epoch);
-    let arg = since.format("%Y-%m-%d %H:%M:%S +0000").to_string();
-    let out = Command::new("git")
-        .arg(format!("--git-dir={}", git_dir.display()))
-        .arg("log")
-        .arg("--pretty=format:%H")
-        .arg(format!("--since={arg}"))
-        .output()
-        .context("running git log --since")?;
-    if !out.status.success() {
-        bail!(
-            "git log --since failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    let since = format!("--since={}", since.format("%Y-%m-%d %H:%M:%S +0000"));
+    Ok(git(list, epoch, &["log", "--pretty=format:%H", &since])?
         .lines()
         .filter(|l| !l.is_empty())
         .map(String::from)
@@ -295,15 +263,5 @@ pub fn list_commits_since(
 /// Read the raw text of the mail stored at `commit` (the public-inbox `m` blob)
 /// from the local mirror.
 pub(crate) fn show_mail(list: &str, epoch: u32, commit: &str) -> Result<String> {
-    let git_dir = local_repo_path(list, epoch);
-    let out = Command::new("git")
-        .arg(format!("--git-dir={}", git_dir.display()))
-        .arg("show")
-        .arg(format!("{commit}:m"))
-        .output()
-        .context("running git show")?;
-    if !out.status.success() {
-        bail!("git show failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    git(list, epoch, &["show", &format!("{commit}:m")])
 }
