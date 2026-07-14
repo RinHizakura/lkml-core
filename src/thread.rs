@@ -12,6 +12,9 @@ use crate::archive;
 use crate::mail::{self, Mail};
 use crate::parse::normalize_message_id;
 
+/// How many mails [`patch_series`] reads with one git process.
+const READ_CHUNK: usize = 256;
+
 /// What identifies the series a patch belongs to: the thread it hangs off, plus
 /// the revision and length of its `[PATCH vV n/m]` tag. Two mails are siblings
 /// iff their [`SeriesTag`]s are equal.
@@ -78,22 +81,27 @@ pub fn patch_series(list: &str, sel: &Mail) -> Result<Vec<Mail>> {
         .context("searching the mirror for the rest of the series")?;
 
     let mut series: BTreeMap<u32, Mail> = BTreeMap::new();
-    for commit in commits {
-        let Ok(mail) = mail::fetch(list, sel.epoch, &commit) else {
+    // One git process per chunk rather than per mail. Chunked rather than read
+    // whole: a prolific sender's patch mails in one epoch run to thousands, and
+    // their raw text need not all be held at once.
+    for chunk in commits.chunks(READ_CHUNK) {
+        let Ok(mails) = mail::fetch(list, sel.epoch, chunk) else {
             continue;
         };
-        let Some(tag) = mail.patch_tag else {
-            continue;
-        };
-        if tag.number == 0
-            || tag.version != sel_tag.version
-            || tag.total != sel_tag.total
-            || !references_root(&mail, &root)
-        {
-            continue;
+        for mail in mails {
+            let Some(tag) = mail.patch_tag else {
+                continue;
+            };
+            if tag.number == 0
+                || tag.version != sel_tag.version
+                || tag.total != sel_tag.total
+                || !references_root(&mail, &root)
+            {
+                continue;
+            }
+            // search_commits answers newest-first, so a resend beats the original.
+            series.entry(tag.number).or_insert(mail);
         }
-        // search_commits answers newest-first, so a resend beats the original.
-        series.entry(tag.number).or_insert(mail);
     }
     // The selected mail is ground truth: keep it even when the pre-filter missed
     // it (an oddly spelled From, say).

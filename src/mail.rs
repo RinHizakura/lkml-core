@@ -48,11 +48,25 @@ pub struct PatchTag {
     pub total: u32,
 }
 
-/// Fetch and parse the mail at `commit` from the local mirror of `list`'s
-/// `epoch`.
-pub fn fetch(list: &str, epoch: u32, commit: &str) -> Result<Mail> {
-    let raw = archive::show_mail(list, epoch, commit)?;
-    Ok(Mail::new(raw, epoch, commit.to_string()))
+/// Fetch and parse the mails at `commits` from the local mirror of `list`'s
+/// `epoch`, in the order asked for.
+///
+/// Reading is always a batch, because the cost of reading a mail is almost
+/// entirely the git process it takes: one `git cat-file --batch` serves the
+/// whole slice, where a process per mail would spend ~1.4ms each on fork and
+/// exec to do ~0.03ms of work. A single mail is just a slice of one — and even
+/// that is cheaper this way than `git show`, which pays for revision machinery
+/// it does not need.
+///
+/// A mail that will not read is skipped rather than failing the batch, so the
+/// result may be shorter than `commits`.
+pub fn fetch(list: &str, epoch: u32, commits: &[String]) -> Result<Vec<Mail>> {
+    let raws = archive::show_mails(list, epoch, commits)?;
+    Ok(raws
+        .into_iter()
+        .zip(commits)
+        .filter_map(|(raw, commit)| Some(Mail::new(raw?, epoch, commit.clone())))
+        .collect())
 }
 
 impl Mail {

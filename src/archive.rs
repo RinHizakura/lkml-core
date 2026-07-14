@@ -5,8 +5,9 @@ use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use std::cmp::Reverse;
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const BASE: &str = "https://lore.kernel.org";
@@ -260,8 +261,75 @@ pub fn list_commits_since(
         .collect())
 }
 
-/// Read the raw text of the mail stored at `commit` (the public-inbox `m` blob)
-/// from the local mirror.
-pub(crate) fn show_mail(list: &str, epoch: u32, commit: &str) -> Result<String> {
-    git(list, epoch, &["show", &format!("{commit}:m")])
+/// Read the mails at `commits` — their public-inbox `m` blobs — in one
+/// `git cat-file --batch`, in the order asked for.
+///
+/// Answers come back in request order, so the result is index-aligned with
+/// `commits`: a commit whose blob will not read — what a failing `show_mail`
+/// would be — is `None` rather than a gap that would shift every mail after it
+/// onto the wrong commit.
+pub(crate) fn show_mails(
+    list: &str,
+    epoch: u32,
+    commits: &[String],
+) -> Result<Vec<Option<String>>> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir = local_repo_path(list, epoch);
+    let mut child = Command::new("git")
+        .arg(format!("--git-dir={}", dir.display()))
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning git cat-file --batch")?;
+
+    // Feed the requests from a thread: git writes each blob as it reads the
+    // request for it, so a caller that wrote every request before reading a byte
+    // of output would deadlock the moment the blobs outgrew the stdout pipe.
+    let requests: String = commits.iter().map(|c| format!("{c}:m\n")).collect();
+    let mut stdin = child.stdin.take().context("git cat-file stdin")?;
+    let feeder = std::thread::spawn(move || stdin.write_all(requests.as_bytes()));
+
+    let out = child
+        .wait_with_output()
+        .context("running git cat-file --batch")?;
+    // The feeder only fails when git died early, which the exit status covers.
+    let _ = feeder.join();
+    if !out.status.success() {
+        bail!("git cat-file --batch failed");
+    }
+    let mut blobs = split_batch(&out.stdout);
+    // Git answers every request; pad anyway so a truncated read can only lose
+    // mails, never shift the ones after it onto the wrong commit.
+    blobs.resize(commits.len(), None);
+    Ok(blobs)
+}
+
+/// Split `git cat-file --batch` output into one entry per answer, in request
+/// order. Every answer opens with a header line: `<oid> <type> <size>` for a
+/// hit, or `<request> missing` for a miss, which is all a miss gets. A hit is
+/// then `size` bytes of content and a newline.
+fn split_batch(mut bytes: &[u8]) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    while let Some(eol) = bytes.iter().position(|&b| b == b'\n') {
+        let header = String::from_utf8_lossy(&bytes[..eol]);
+        let size = header
+            .rsplit(' ')
+            .next()
+            .and_then(|s| s.parse::<usize>().ok());
+        bytes = &bytes[eol + 1..];
+        let Some(size) = size else {
+            out.push(None); // a miss: no content follows the header
+            continue;
+        };
+        let Some(content) = bytes.get(..size) else {
+            break; // truncated output; keep what we have
+        };
+        out.push(Some(String::from_utf8_lossy(content).into_owned()));
+        bytes = &bytes[(size + 1).min(bytes.len())..];
+    }
+    out
 }
