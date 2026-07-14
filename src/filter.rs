@@ -124,8 +124,9 @@ impl DateFilter {
     }
 }
 
-fn local_midnight_to_utc(date: NaiveDate) -> Result<DateTime<Utc>> {
-    let naive = date.and_hms_opt(0, 0, 0).context("date overflow")?;
+/// Read a wall-clock time as local and convert it to UTC. Errors on the hour a
+/// DST jump makes ambiguous or skips entirely.
+fn local_to_utc(naive: NaiveDateTime) -> Result<DateTime<Utc>> {
     Local
         .from_local_datetime(&naive)
         .single()
@@ -133,14 +134,14 @@ fn local_midnight_to_utc(date: NaiveDate) -> Result<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+fn local_midnight_to_utc(date: NaiveDate) -> Result<DateTime<Utc>> {
+    local_to_utc(date.and_hms_opt(0, 0, 0).context("date overflow")?)
+}
+
 fn parse_local_datetime(s: &str) -> Result<DateTime<Utc>> {
-    let naive =
-        NaiveDateTime::parse_from_str(s, "%Y/%m/%d %H:%M").context("expected YYYY/MM/DD HH:MM")?;
-    Local
-        .from_local_datetime(&naive)
-        .single()
-        .context("ambiguous local time")
-        .map(|dt| dt.with_timezone(&Utc))
+    local_to_utc(
+        NaiveDateTime::parse_from_str(s, "%Y/%m/%d %H:%M").context("expected YYYY/MM/DD HH:MM")?,
+    )
 }
 
 /// Parse user-entered date filter text into a half-open UTC range. Accepts:
