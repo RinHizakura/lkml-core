@@ -248,10 +248,7 @@ pub fn search_commits(
     }
     let out = cmd.output().context("running git log")?;
     if !out.status.success() {
-        bail!(
-            "git log failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bail!("git log failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     let mut rows: Vec<(i64, String)> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -306,10 +303,7 @@ pub(crate) fn show_mail(list: &str, epoch: u32, commit: &str) -> Result<String> 
         .output()
         .context("running git show")?;
     if !out.status.success() {
-        bail!(
-            "git show failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bail!("git show failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

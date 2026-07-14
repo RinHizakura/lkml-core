@@ -230,7 +230,10 @@ fn parse_patch_tag(subject: &str) -> Option<PatchTag> {
     for w in group.replace(',', " ").split_whitespace() {
         // "v2" -> revision 2. Only a bare v-then-digits word, so "vfs" and
         // "PATCH" fall through.
-        if let Some(v) = w.strip_prefix(['v', 'V']).and_then(|d| d.parse::<u32>().ok()) {
+        if let Some(v) = w
+            .strip_prefix(['v', 'V'])
+            .and_then(|d| d.parse::<u32>().ok())
+        {
             out.version = v;
         } else if let Some((n, m)) = w.split_once('/') {
             // Both sides must be numbers: "[PATCH net/tcp]" has a slash but no

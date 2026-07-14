@@ -77,7 +77,9 @@ impl Filter for NameFilter {
     fn matches(&self, mail: &Mail) -> bool {
         match &self.needle {
             None => true,
-            Some(n) => (self.field)(mail).to_lowercase().contains(&n.to_lowercase()),
+            Some(n) => (self.field)(mail)
+                .to_lowercase()
+                .contains(&n.to_lowercase()),
         }
     }
 }
@@ -132,8 +134,8 @@ fn local_midnight_to_utc(date: NaiveDate) -> Result<DateTime<Utc>> {
 }
 
 fn parse_local_datetime(s: &str) -> Result<DateTime<Utc>> {
-    let naive = NaiveDateTime::parse_from_str(s, "%Y/%m/%d %H:%M")
-        .context("expected YYYY/MM/DD HH:MM")?;
+    let naive =
+        NaiveDateTime::parse_from_str(s, "%Y/%m/%d %H:%M").context("expected YYYY/MM/DD HH:MM")?;
     Local
         .from_local_datetime(&naive)
         .single()
@@ -150,12 +152,18 @@ fn parse_date_range(trimmed: &str) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     if lower == "today" {
         let today = Local::now().date_naive();
         let tomorrow = today.succ_opt().context("date overflow")?;
-        return Ok((local_midnight_to_utc(today)?, local_midnight_to_utc(tomorrow)?));
+        return Ok((
+            local_midnight_to_utc(today)?,
+            local_midnight_to_utc(tomorrow)?,
+        ));
     }
     if lower == "yesterday" {
         let today = Local::now().date_naive();
         let yesterday = today.pred_opt().context("date underflow")?;
-        return Ok((local_midnight_to_utc(yesterday)?, local_midnight_to_utc(today)?));
+        return Ok((
+            local_midnight_to_utc(yesterday)?,
+            local_midnight_to_utc(today)?,
+        ));
     }
     let Some((start_s, end_s)) = trimmed.split_once(" to ") else {
         bail!("expected 'today', 'yesterday', or '<start> to <end>'");
