@@ -265,9 +265,8 @@ pub fn list_commits_since(
 /// `git cat-file --batch`, in the order asked for.
 ///
 /// Answers come back in request order, so the result is index-aligned with
-/// `commits`: a commit whose blob will not read — what a failing `show_mail`
-/// would be — is `None` rather than a gap that would shift every mail after it
-/// onto the wrong commit.
+/// `commits`: a commit whose blob will not read is `None`, rather than a gap that
+/// would shift every mail after it onto the wrong commit.
 pub(crate) fn show_mails(
     list: &str,
     epoch: u32,
