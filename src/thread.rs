@@ -30,13 +30,26 @@ pub struct SeriesTag {
     pub total: u32,
 }
 
+/// The normalized Message-ID of the thread `mail` hangs off: the first
+/// `References` entry, else the mail it replies to, else itself — a thread root
+/// (a cover letter has no References and is its own root). Mails of one thread
+/// share this key, so grouping by it rebuilds threads without parsing subjects.
+pub fn thread_root(mail: &Mail) -> String {
+    let root = mail
+        .references
+        .first()
+        .map(String::as_str)
+        .or_else(|| (!mail.in_reply_to.is_empty()).then_some(mail.in_reply_to.as_str()))
+        .unwrap_or(&mail.message_id);
+    normalize_message_id(root)
+}
+
 /// The series `mail` belongs to, or `None` when it is not part of a multi-patch
 /// series — ordinary mail, a review reply, or a lone `[PATCH]`.
 pub fn series_tag(mail: &Mail) -> Option<SeriesTag> {
     let tag = mail.patch_tag.filter(|t| t.total > 1)?;
     Some(SeriesTag {
-        // A cover letter has no References and is its own root.
-        root: normalize_message_id(mail.references.first().unwrap_or(&mail.message_id)),
+        root: thread_root(mail),
         version: tag.version,
         total: tag.total,
     })
@@ -71,7 +84,7 @@ pub fn patch_series(list: &str, sel: &Mail) -> Result<Vec<Mail>> {
     let Some(sel_tag) = sel.patch_tag.filter(|t| t.number > 0) else {
         return Ok(Vec::new());
     };
-    let root = normalize_message_id(sel.references.first().unwrap_or(&sel.message_id));
+    let root = thread_root(sel);
 
     // Let git log prune the epoch before any mail is read.
     // TODO: only the selected mail's epoch is searched, and only that
