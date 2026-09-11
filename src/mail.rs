@@ -69,6 +69,54 @@ pub fn fetch(list: &str, epoch: u32, commits: &[String]) -> Result<Vec<Mail>> {
         .collect())
 }
 
+/// How many mails [`read`] hands one git process. Large enough that the
+/// process is amortized over many blobs, small enough that a caller draining
+/// the iterator sees mails arrive (and can stop) without waiting on the lot.
+const READ_CHUNK: usize = 256;
+
+/// Read `commits` lazily, a chunk per git process, yielding each mail as it
+/// is parsed. This is the one way to read a window of mails: every caller that
+/// walks a list of commits goes through here, so chunking and the policy for
+/// unreadable mails live in one place. A mail that will not read — or a whole
+/// chunk the mirror refuses — is skipped and counted in [`Read::skipped`]
+/// rather than ending the iteration, since a digest or a page is worth more
+/// complete-but-short than absent.
+pub fn read<'a>(list: &'a str, epoch: u32, commits: &'a [String]) -> Read<'a> {
+    Read {
+        list,
+        epoch,
+        chunks: commits.chunks(READ_CHUNK),
+        buf: Vec::new().into_iter(),
+        skipped: 0,
+    }
+}
+
+/// The iterator behind [`read`].
+pub struct Read<'a> {
+    list: &'a str,
+    epoch: u32,
+    chunks: std::slice::Chunks<'a, String>,
+    buf: std::vec::IntoIter<Mail>,
+    /// Commits asked for that yielded no mail so far.
+    pub skipped: usize,
+}
+
+impl Iterator for Read<'_> {
+    type Item = Mail;
+
+    fn next(&mut self) -> Option<Mail> {
+        loop {
+            if let Some(mail) = self.buf.next() {
+                return Some(mail);
+            }
+            let chunk = self.chunks.next()?;
+            let mails = fetch(self.list, self.epoch, chunk).unwrap_or_default();
+            self.skipped += chunk.len() - mails.len();
+            self.buf = mails.into_iter();
+        }
+    }
+}
+
 impl Mail {
     /// Parse raw mail text into a [`Mail`], tagged with the mirror `epoch`/`commit`
     /// it came from. Subject/From/To are MIME-decoded; the Message-ID is kept
