@@ -1,18 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 
+//! The one constraint both apps share: a date window over a mail's `Date:`.
+//! Parsing user text (local wall-clock) into UTC and testing a mail against
+//! the window live here; how a window is prompted for, displayed as "(none)",
+//! or combined with other constraints is each app's own.
+
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use std::fmt;
 
 use crate::mail::Mail;
-use crate::parse;
-
-/// A predicate over a parsed [`Mail`]. An inactive filter imposes no constraint
-/// and matches every mail; an active one keeps only the mails it accepts.
-pub trait Filter {
-    fn is_active(&self) -> bool;
-    fn matches(&self, mail: &Mail) -> bool;
-}
 
 /// Half-open date range `[start, end)` stored in UTC.
 #[derive(Clone, Debug)]
@@ -21,6 +18,52 @@ pub struct DateRange {
     pub end: DateTime<Utc>,
 }
 
+impl DateRange {
+    /// Parse user-entered text into a range. Times are read as local
+    /// wall-clock and stored in UTC. Accepts:
+    ///   - `today`
+    ///   - `yesterday`
+    ///   - `YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM`
+    pub fn parse(text: &str) -> Result<DateRange> {
+        let trimmed = text.trim();
+        let lower = trimmed.to_lowercase();
+        if lower == "today" {
+            let today = Local::now().date_naive();
+            let tomorrow = today.succ_opt().context("date overflow")?;
+            return Ok(DateRange {
+                start: local_midnight_to_utc(today)?,
+                end: local_midnight_to_utc(tomorrow)?,
+            });
+        }
+        if lower == "yesterday" {
+            let today = Local::now().date_naive();
+            let yesterday = today.pred_opt().context("date underflow")?;
+            return Ok(DateRange {
+                start: local_midnight_to_utc(yesterday)?,
+                end: local_midnight_to_utc(today)?,
+            });
+        }
+        let Some((start_s, end_s)) = trimmed.split_once(" to ") else {
+            bail!("expected 'today', 'yesterday', or '<start> to <end>'");
+        };
+        Ok(DateRange {
+            start: parse_local_datetime(start_s.trim()).context("parsing start date")?,
+            end: parse_local_datetime(end_s.trim()).context("parsing end date")?,
+        })
+    }
+
+    /// Whether the mail's `Date:` falls in the range. A mail with no parsable
+    /// date is outside every range.
+    pub fn contains(&self, mail: &Mail) -> bool {
+        let Some(date) = mail.date else {
+            return false;
+        };
+        let utc = date.with_timezone(&Utc);
+        utc >= self.start && utc < self.end
+    }
+}
+
+/// Rendered in local time, the way it was typed.
 impl fmt::Display for DateRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -29,98 +72,6 @@ impl fmt::Display for DateRange {
             self.start.with_timezone(&Local).format("%Y/%m/%d %H:%M"),
             self.end.with_timezone(&Local).format("%Y/%m/%d %H:%M"),
         )
-    }
-}
-
-/// Case-insensitive substring constraint over one of the mail's text headers.
-/// Subject and author differ only in which header they read.
-#[derive(Clone, Debug)]
-pub struct NameFilter {
-    pub needle: Option<String>,
-    field: fn(&Mail) -> &str,
-}
-
-impl NameFilter {
-    /// Match against the mail's `Subject`.
-    pub fn subject() -> Self {
-        Self {
-            needle: None,
-            field: |mail| &mail.subject,
-        }
-    }
-
-    /// Match against the whole decoded `From` header, so both the display name
-    /// and the address are searchable.
-    pub fn author() -> Self {
-        Self {
-            needle: None,
-            field: |mail| &mail.from,
-        }
-    }
-
-    /// Replace the needle from raw user text. Empty text clears the filter.
-    pub fn set(&mut self, text: &str) {
-        let trimmed = text.trim();
-        self.needle = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
-}
-
-impl Filter for NameFilter {
-    fn is_active(&self) -> bool {
-        self.needle.is_some()
-    }
-
-    fn matches(&self, mail: &Mail) -> bool {
-        match &self.needle {
-            None => true,
-            Some(n) => (self.field)(mail)
-                .to_lowercase()
-                .contains(&n.to_lowercase()),
-        }
-    }
-}
-
-impl fmt::Display for NameFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.needle {
-            None => f.write_str("(none)"),
-            Some(n) => f.write_str(n),
-        }
-    }
-}
-
-/// Date-range constraint. Empty (`None`) means "no constraint" — every mail
-/// matches regardless of its `Date` header.
-#[derive(Clone, Debug, Default)]
-pub struct DateFilter {
-    pub date_range: Option<DateRange>,
-}
-
-impl DateFilter {
-    pub fn new() -> Self {
-        Self { date_range: None }
-    }
-
-    /// Replace the range from raw user text. Accepts:
-    ///   - `today`
-    ///   - `yesterday`
-    ///   - `YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM`
-    ///
-    /// Empty text clears the filter; malformed text returns an error and
-    /// leaves the existing filter unchanged.
-    pub fn set(&mut self, text: &str) -> Result<()> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            self.date_range = None;
-            return Ok(());
-        }
-        let (start, end) = parse_date_range(trimmed)?;
-        self.date_range = Some(DateRange { start, end });
-        Ok(())
     }
 }
 
@@ -144,90 +95,48 @@ fn parse_local_datetime(s: &str) -> Result<DateTime<Utc>> {
     )
 }
 
-/// Parse user-entered date filter text into a half-open UTC range. Accepts:
-///   - `today`
-///   - `yesterday`
-///   - `YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM`
-fn parse_date_range(trimmed: &str) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let lower = trimmed.to_lowercase();
-    if lower == "today" {
-        let today = Local::now().date_naive();
-        let tomorrow = today.succ_opt().context("date overflow")?;
-        return Ok((
-            local_midnight_to_utc(today)?,
-            local_midnight_to_utc(tomorrow)?,
-        ));
-    }
-    if lower == "yesterday" {
-        let today = Local::now().date_naive();
-        let yesterday = today.pred_opt().context("date underflow")?;
-        return Ok((
-            local_midnight_to_utc(yesterday)?,
-            local_midnight_to_utc(today)?,
-        ));
-    }
-    let Some((start_s, end_s)) = trimmed.split_once(" to ") else {
-        bail!("expected 'today', 'yesterday', or '<start> to <end>'");
-    };
-    let start = parse_local_datetime(start_s.trim()).context("parsing start date")?;
-    let end = parse_local_datetime(end_s.trim()).context("parsing end date")?;
-    Ok((start, end))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::FixedOffset;
 
-impl Filter for DateFilter {
-    fn is_active(&self) -> bool {
-        self.date_range.is_some()
+    fn range(start: &str, end: &str) -> DateRange {
+        DateRange::parse(&format!("{start} to {end}")).unwrap()
     }
 
-    fn matches(&self, mail: &Mail) -> bool {
-        let Some(range) = &self.date_range else {
-            return true;
+    #[test]
+    fn explicit_range_is_half_open() {
+        let r = range("2026/01/01 00:00", "2026/01/02 00:00");
+        assert!(r.start < r.end);
+        let at = |s: &str| Mail {
+            date: Some(
+                Local
+                    .from_local_datetime(
+                        &NaiveDateTime::parse_from_str(s, "%Y/%m/%d %H:%M").unwrap(),
+                    )
+                    .single()
+                    .unwrap()
+                    .with_timezone(&FixedOffset::east_opt(0).unwrap()),
+            ),
+            ..Mail::default()
         };
-        let Some(date) = mail.date else {
-            return false;
-        };
-        let utc = date.with_timezone(&Utc);
-        utc >= range.start && utc < range.end
-    }
-}
-
-impl fmt::Display for DateFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.date_range {
-            None => f.write_str("(none)"),
-            Some(r) => write!(f, "{}", r),
-        }
-    }
-}
-
-/// Message-ID constraint: matches the one mail whose `Message-ID` equals the
-/// target (angle brackets and whitespace ignored). Empty means "no constraint".
-#[derive(Clone, Debug, Default)]
-pub struct MsgidFilter {
-    /// Normalized target id (angle brackets and whitespace stripped).
-    target: String,
-}
-
-impl MsgidFilter {
-    pub fn new(message_id: &str) -> Self {
-        Self {
-            target: parse::normalize_message_id(message_id),
-        }
-    }
-}
-
-impl Filter for MsgidFilter {
-    fn is_active(&self) -> bool {
-        !self.target.is_empty()
+        assert!(r.contains(&at("2026/01/01 00:00")));
+        assert!(r.contains(&at("2026/01/01 23:59")));
+        assert!(!r.contains(&at("2026/01/02 00:00")));
+        assert!(!r.contains(&Mail::default())); // no Date: header
     }
 
-    fn matches(&self, mail: &Mail) -> bool {
-        parse::normalize_message_id(&mail.message_id) == self.target
+    #[test]
+    fn today_and_yesterday_abut() {
+        let today = DateRange::parse("today").unwrap();
+        let yesterday = DateRange::parse("Yesterday").unwrap();
+        assert_eq!(yesterday.end, today.start);
     }
-}
 
-impl fmt::Display for MsgidFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<{}>", self.target)
+    #[test]
+    fn malformed_text_is_an_error() {
+        assert!(DateRange::parse("last week").is_err());
+        assert!(DateRange::parse("2026/01/01 00:00").is_err());
+        assert!(DateRange::parse("").is_err());
     }
 }
