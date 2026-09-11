@@ -73,26 +73,128 @@ fn manifest_epochs(json: &str, list: &str) -> Vec<u32> {
     epochs.into_iter().collect()
 }
 
-/// The epochs published for `list` in lore's manifest, oldest-first. This is
-/// the archive module's answer to "what epochs does this list have?": it owns
-/// the HTTP client and manifest parsing so callers never see either. Hits the
-/// network. Errors if the list has no epochs (typically a misspelled name).
-pub fn list_epochs(list: &str) -> Result<Vec<u32>> {
-    let client = http_client()?;
-    let manifest = fetch_manifest(&client)?;
-    let epochs = manifest_epochs(&manifest, list);
-    if epochs.is_empty() {
-        bail!("no epochs found for list '{list}'");
+/// The epochs cloned locally for `list`, oldest-first: every `<n>.git` under
+/// the list's cache dir. What the mirror knows without the network.
+fn local_epochs(list: &str) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(archive_root().join(list)) else {
+        return Vec::new();
+    };
+    let mut epochs: Vec<u32> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_suffix(".git")?
+                .parse::<u32>()
+                .ok()
+        })
+        .collect();
+    epochs.sort_unstable();
+    epochs
+}
+
+/// A list's mirror: the epochs lore publishes for it and, per epoch, whether a
+/// local clone exists. This is where the epoch lifecycle lives — which epochs
+/// there are, which are present, and how one is made present (clone vs
+/// update) — so neither app has to track it. Cheap to clone: it holds only
+/// the list name and epoch numbers.
+#[derive(Clone, Debug)]
+pub struct Mirror {
+    list: String,
+    /// Oldest-first, as lore's manifest lists them.
+    epochs: Vec<u32>,
+}
+
+impl Mirror {
+    /// The mirror for `list` as lore's manifest describes it. Hits the network
+    /// once; errors if the list has no epochs (typically a misspelled name).
+    pub fn open(list: &str) -> Result<Mirror> {
+        let client = http_client()?;
+        let manifest = fetch_manifest(&client)?;
+        let epochs = manifest_epochs(&manifest, list);
+        if epochs.is_empty() {
+            bail!("no epochs found for list '{list}'");
+        }
+        Ok(Mirror {
+            list: list.to_string(),
+            epochs,
+        })
     }
-    Ok(epochs)
+
+    /// The mirror for `list` as the local cache alone describes it: only the
+    /// epochs already cloned. No network — the fallback when [`Mirror::open`]
+    /// cannot reach lore.
+    pub fn local(list: &str) -> Mirror {
+        Mirror {
+            list: list.to_string(),
+            epochs: local_epochs(list),
+        }
+    }
+
+    pub fn list(&self) -> &str {
+        &self.list
+    }
+
+    /// Every epoch of the list, oldest-first.
+    pub fn epochs(&self) -> &[u32] {
+        &self.epochs
+    }
+
+    /// The newest epoch: the one still receiving mail.
+    pub fn newest(&self) -> Option<u32> {
+        self.epochs.last().copied()
+    }
+
+    pub fn is_cloned(&self, epoch: u32) -> bool {
+        local_repo_path(&self.list, epoch).exists()
+    }
+
+    /// Make `epoch` present and current locally, choosing how on its own:
+    /// refresh it with `git remote update` if already cloned, otherwise `git
+    /// clone --mirror` it. Callers name the epoch they want and leave the
+    /// clone-vs-update decision — and which git invocation it implies — here.
+    pub fn ensure(&self, epoch: u32) -> Result<()> {
+        if self.is_cloned(epoch) {
+            update_mirror(&self.list, epoch)
+        } else {
+            clone_mirror(&self.list, epoch)
+        }
+    }
+
+    /// The epochs to search for a window reaching back to `window_start`,
+    /// newest first. Always refreshes the newest epoch; then, while the oldest
+    /// epoch held so far still *begins after* `window_start`, takes the next
+    /// earlier epoch — stopping once the window is covered or the list's first
+    /// epoch is reached.
+    ///
+    /// Before cloning an epoch that is not yet local, `consent(epoch)` is
+    /// asked; a `false` stops the walk there and returns what is covered so
+    /// far. Cloning blocks and earlier epochs are large, so that is the
+    /// caller's moment to say so on its own output — this module writes to
+    /// nothing but the cache.
+    pub fn epochs_covering(
+        &self,
+        window_start: DateTime<Utc>,
+        consent: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<Vec<u32>> {
+        let mut used = Vec::new();
+        for &epoch in self.epochs.iter().rev() {
+            if !self.is_cloned(epoch) && !consent(epoch)? {
+                break;
+            }
+            self.ensure(epoch)?;
+            used.push(epoch);
+            let started = epoch_start_date(&self.list, epoch)?;
+            if started.is_some_and(|d| d <= window_start) {
+                break;
+            }
+        }
+        Ok(used)
+    }
 }
 
 fn repo_url(list: &str, epoch: u32) -> String {
     format!("{BASE}/{list}/git/{epoch}.git")
-}
-
-pub fn repo_exists(list: &str, epoch: u32) -> bool {
-    local_repo_path(list, epoch).exists()
 }
 
 /// Run git against the local mirror of `list`'s `epoch` and hand back its
@@ -145,19 +247,6 @@ fn clone_mirror(list: &str, epoch: u32) -> Result<()> {
     Ok(())
 }
 
-/// Make `epoch` present and current locally, choosing how on its own: refresh
-/// it with `git remote update` if already cloned, otherwise `git clone
-/// --mirror` it. Callers name the epoch they want available and leave the
-/// clone-vs-update decision — and which git invocation it implies — to the
-/// archive module. Also the building block for [`ensure_epoch_by_time`].
-pub fn ensure_epoch(list: &str, epoch: u32) -> Result<()> {
-    if repo_exists(list, epoch) {
-        update_mirror(list, epoch)
-    } else {
-        clone_mirror(list, epoch)
-    }
-}
-
 /// When this epoch started archiving — the minimum *committer* date (`%ct`)
 /// across all commits, or `None` if the repo has no commits. public-inbox sets
 /// the committer date to the moment it imported the mail, so it is monotonic
@@ -172,37 +261,6 @@ pub fn epoch_start_date(list: &str, epoch: u32) -> Result<Option<DateTime<Utc>>>
         .filter_map(|l| l.trim().parse::<i64>().ok())
         .min();
     Ok(min.and_then(|ts| DateTime::from_timestamp(ts, 0)))
-}
-
-/// Ensure enough epochs are cloned locally that the mirror reaches back to
-/// `window_start`. Always refreshes the latest epoch; then, while the oldest
-/// epoch held so far still *begins after* `window_start`, clones the next
-/// earlier epoch — stopping once the window is covered or the list's first
-/// epoch is reached. Returns the epochs to search, newest first.
-///
-/// Hits the network for the manifest and for each `git remote update` /
-/// `git clone --mirror`. Earlier epochs are large, so this only fetches them
-/// when a query genuinely needs older mail than the local mirror already holds.
-pub fn ensure_epoch_by_time(list: &str, window_start: DateTime<Utc>) -> Result<Vec<u32>> {
-    let epochs = list_epochs(list)?;
-    let mut used = Vec::new();
-    let mut i = epochs.len() - 1;
-    loop {
-        let epoch = epochs[i];
-        if !repo_exists(list, epoch) {
-            eprintln!("Fetching earlier epoch {epoch} for '{list}'…");
-        }
-        ensure_epoch(list, epoch)?;
-        used.push(epoch);
-        let started = epoch_start_date(list, epoch)?;
-        let covered = started.is_some_and(|d| d <= window_start);
-        if covered || i == 0 {
-            break;
-        }
-        i -= 1;
-    }
-    used.sort_unstable_by(|a, b| b.cmp(a));
-    Ok(used)
 }
 
 /// All commits in the repo, newest first by the mail's own `Date:` header.
