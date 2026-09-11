@@ -25,7 +25,7 @@ format) of every repo lore serves:
 }
 ```
 
-`archive::list_epochs` fetches this file, decompresses it, and extracts the
+`archive::Mirror::open` fetches this file, decompresses it, and extracts the
 epoch numbers (`0..=19` above) for a given list.
 
 ### Epochs
@@ -50,9 +50,9 @@ Mirrors live under:
 $XDG_CACHE_HOME/lkml-tools/archives/<list>/<epoch>.git
 ```
 
-(falls back to `~/.cache/lkml-tools/archives/...`). `archive::ensure_epoch`
+(falls back to `~/.cache/lkml-tools/archives/...`). `Mirror::ensure`
 clones the epoch if missing, otherwise runs `git remote update`. Reading a mail
-uses `git log` / `git show` against the local mirror — no network round-trip
+uses `git log` / `git cat-file --batch` against the local mirror — no network round-trip
 once the clone is in place. Older epochs are cloned on demand when a query
 reaches before the oldest local mail.
 
