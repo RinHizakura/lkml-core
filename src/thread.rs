@@ -6,7 +6,7 @@
 //! patch mails of one thread.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::archive;
 use crate::mail::{self, Mail};
@@ -52,21 +52,52 @@ pub fn series_tag(mail: &Mail) -> Option<SeriesTag> {
     })
 }
 
-/// Anything that can sit in a reply tree: it knows its own id and its parent's.
-/// Implemented for [`Mail`]; apps can implement it for their own wrapper types
-/// so [`reply_counts`] works without copying mails out of them.
-pub trait Threaded {
-    fn message_id(&self) -> &str;
-    fn in_reply_to(&self) -> &str;
+/// Reorder `mails` so every patch series forms one block — cover letter (or
+/// lowest-numbered patch) first, the rest ascending — sitting where the series'
+/// newest mail was, and flag the members that belong under the head. A series
+/// with only one member present stays where it is, unflagged: there is nothing
+/// to indent it under.
+pub fn group_series(mails: &[Mail]) -> (Vec<Mail>, Vec<bool>) {
+    let tags: Vec<Option<SeriesTag>> = mails.iter().map(series_tag).collect();
+    let mut series: HashMap<&SeriesTag, Vec<usize>> = HashMap::new();
+    for (i, tag) in tags.iter().enumerate() {
+        if let Some(tag) = tag {
+            series.entry(tag).or_default().push(i);
+        }
+    }
+    for members in series.values_mut() {
+        members.sort_by_key(|&i| mails[i].patch_tag.map_or(0, |t| t.number));
+    }
+
+    let mut out = Vec::with_capacity(mails.len());
+    let mut indent = Vec::with_capacity(mails.len());
+    let mut placed = vec![false; mails.len()];
+    for i in 0..mails.len() {
+        if placed[i] {
+            continue;
+        }
+        let block = match tags[i].as_ref().and_then(|tag| series.get(tag)) {
+            Some(members) if members.len() > 1 => members.as_slice(),
+            _ => std::slice::from_ref(&i),
+        };
+        for (nth, &j) in block.iter().enumerate() {
+            placed[j] = true;
+            out.push(mails[j].clone());
+            indent.push(nth > 0);
+        }
+    }
+    (out, indent)
 }
 
-impl Threaded for Mail {
-    fn message_id(&self) -> &str {
-        &self.message_id
-    }
-    fn in_reply_to(&self) -> &str {
-        &self.in_reply_to
-    }
+/// Is every patch of `tag` among `mails`? The 0/m cover letter is optional;
+/// 1/m..m/m are not.
+pub fn is_whole(mails: &[Mail], tag: &SeriesTag) -> bool {
+    let seen: HashSet<u32> = mails
+        .iter()
+        .filter(|mail| series_tag(mail).as_ref() == Some(tag))
+        .filter_map(|mail| mail.patch_tag.map(|patch| patch.number))
+        .collect();
+    (1..=tag.total).all(|n| seen.contains(&n))
 }
 
 /// Every patch of `sel`'s series, ordered 1/m, 2/m, …, wherever the mails sit
@@ -125,21 +156,21 @@ fn references_root(mail: &Mail, root: &str) -> bool {
 /// (its thread-subtree size minus itself). Only items within `items` are
 /// counted, so a thread root reflects the in-set thread size. The result is
 /// index-aligned with `items`.
-pub fn reply_counts<T: Threaded>(items: &[T]) -> Vec<usize> {
+pub fn reply_counts(items: &[Mail]) -> Vec<usize> {
     let mut id_to_idx: HashMap<String, usize> = HashMap::new();
     for (i, it) in items.iter().enumerate() {
-        if !it.message_id().is_empty() {
+        if !it.message_id.is_empty() {
             id_to_idx
-                .entry(normalize_message_id(it.message_id()))
+                .entry(normalize_message_id(&it.message_id))
                 .or_insert(i);
         }
     }
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); items.len()];
     for (i, it) in items.iter().enumerate() {
-        if it.in_reply_to().is_empty() {
+        if it.in_reply_to.is_empty() {
             continue;
         }
-        if let Some(&p) = id_to_idx.get(&normalize_message_id(it.in_reply_to())) {
+        if let Some(&p) = id_to_idx.get(&normalize_message_id(&it.in_reply_to)) {
             if p != i {
                 children[p].push(i);
             }
@@ -174,4 +205,121 @@ fn subtree_size(
     on_stack[i] = false;
     memo[i] = Some(total);
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mail::PatchTag;
+
+    /// Patch `number/total` (v1) of the series rooted at `<root>`; `number` 0
+    /// is the cover letter, so it is its own root.
+    fn patch(root: &str, number: u32, total: u32) -> Mail {
+        Mail {
+            subject: format!("[{root} {number}/{total}]"),
+            message_id: if number == 0 {
+                format!("<{root}>")
+            } else {
+                format!("<{root}.{number}>")
+            },
+            references: if number == 0 {
+                Vec::new()
+            } else {
+                vec![format!("<{root}>")]
+            },
+            patch_tag: Some(PatchTag {
+                version: 1,
+                number,
+                total,
+            }),
+            ..Mail::default()
+        }
+    }
+
+    fn plain(subject: &str) -> Mail {
+        Mail {
+            subject: subject.to_string(),
+            ..Mail::default()
+        }
+    }
+
+    fn subjects(mails: &[Mail]) -> Vec<&str> {
+        mails.iter().map(|m| m.subject.as_str()).collect()
+    }
+
+    #[test]
+    fn series_forms_a_block_where_its_newest_mail_sat() {
+        let mails = vec![
+            patch("a", 2, 3),
+            plain("x"),
+            patch("a", 1, 3),
+            patch("a", 3, 3),
+        ];
+        let (out, indent) = group_series(&mails);
+        assert_eq!(subjects(&out), ["[a 1/3]", "[a 2/3]", "[a 3/3]", "x"]);
+        assert_eq!(indent, [false, true, true, false]);
+    }
+
+    #[test]
+    fn cover_letter_heads_its_block() {
+        let mails = vec![patch("a", 1, 2), patch("a", 0, 2), patch("a", 2, 2)];
+        let (out, indent) = group_series(&mails);
+        assert_eq!(subjects(&out), ["[a 0/2]", "[a 1/2]", "[a 2/2]"]);
+        assert_eq!(indent, [false, true, true]);
+    }
+
+    #[test]
+    fn two_series_group_independently() {
+        let mails = vec![
+            patch("a", 2, 2),
+            patch("b", 2, 2),
+            patch("b", 1, 2),
+            patch("a", 1, 2),
+        ];
+        let (out, _) = group_series(&mails);
+        assert_eq!(subjects(&out), ["[a 1/2]", "[a 2/2]", "[b 1/2]", "[b 2/2]"]);
+    }
+
+    #[test]
+    fn stray_member_and_lone_patch_stay_put() {
+        // Only 2/9 of its series is here, and a lone [PATCH 1/1] is no series:
+        // nothing to pull together, nothing indented.
+        let mails = vec![plain("x"), patch("s", 2, 9), patch("l", 1, 1)];
+        let (out, indent) = group_series(&mails);
+        assert_eq!(subjects(&out), ["x", "[s 2/9]", "[l 1/1]"]);
+        assert_eq!(indent, [false, false, false]);
+    }
+
+    #[test]
+    fn is_whole_ignores_missing_cover_and_other_series() {
+        let mails = vec![patch("a", 1, 2), patch("b", 2, 2), patch("a", 2, 2)];
+        let tag_a = series_tag(&mails[0]).unwrap();
+        assert!(is_whole(&mails, &tag_a)); // 1..=2 present; no cover needed
+        let tag_b = series_tag(&mails[1]).unwrap();
+        assert!(!is_whole(&mails, &tag_b)); // b is missing 1/2
+    }
+
+    #[test]
+    fn thread_root_falls_back_to_in_reply_to_then_self() {
+        let mut m = plain("x");
+        m.message_id = "<self>".into();
+        assert_eq!(thread_root(&m), "self");
+        m.in_reply_to = "<parent>".into();
+        assert_eq!(thread_root(&m), "parent");
+        m.references = vec!["<root>".into(), "<parent>".into()];
+        assert_eq!(thread_root(&m), "root");
+    }
+
+    #[test]
+    fn reply_counts_size_each_subtree() {
+        let mut root = plain("r");
+        root.message_id = "<r>".into();
+        let mut a = plain("a");
+        a.message_id = "<a>".into();
+        a.in_reply_to = "<r>".into();
+        let mut b = plain("b");
+        b.message_id = "<b>".into();
+        b.in_reply_to = "<a>".into();
+        assert_eq!(reply_counts(&[root, a, b]), [2, 1, 0]);
+    }
 }
