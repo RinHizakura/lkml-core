@@ -291,16 +291,23 @@ pub fn search_commits(
     }
     args.extend(grep.iter().chain(author.iter()).map(String::as_str));
 
-    let mut rows: Vec<(i64, String)> = git(list, epoch, &args)?
+    Ok(newest_first(&git(list, epoch, &args)?))
+}
+
+/// Order the hashes of `git log --pretty=format:%H %at` output newest
+/// author-date (mail `Date:`) first. A row without a parsable timestamp sorts
+/// oldest; a row with no space at all is dropped. Stable, so rows sharing a
+/// second keep git's order.
+fn newest_first(rows: &str) -> Vec<String> {
+    let mut rows: Vec<(i64, String)> = rows
         .lines()
         .filter_map(|l| {
             let (hash, ts) = l.split_once(' ')?;
             Some((ts.trim().parse::<i64>().unwrap_or(0), hash.to_string()))
         })
         .collect();
-    // Newest author-date (mail Date) first.
     rows.sort_by_key(|&(ts, _)| Reverse(ts));
-    Ok(rows.into_iter().map(|(_, hash)| hash).collect())
+    rows.into_iter().map(|(_, hash)| hash).collect()
 }
 
 /// List commits whose committer date is at or after `since`. Uses
@@ -389,4 +396,47 @@ fn split_batch(mut bytes: &[u8]) -> Vec<Option<String>> {
         bytes = &bytes[(size + 1).min(bytes.len())..];
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_epochs_picks_the_lists_epochs_in_order() {
+        let json = r#"{
+          "/lkml/git/2.git": {"modified": 1},
+          "/lkml/git/0.git": {"modified": 1},
+          "/linux-mm/git/7.git": {"modified": 1},
+          "/lkml/git/12.git": {"modified": 1},
+          "/lkml-foo/git/3.git": {"modified": 1}
+        }"#;
+        assert_eq!(manifest_epochs(json, "lkml"), [0, 2, 12]);
+        assert_eq!(manifest_epochs(json, "linux-mm"), [7]);
+        assert!(manifest_epochs(json, "nope").is_empty());
+    }
+
+    #[test]
+    fn newest_first_sorts_by_author_date_and_drops_bad_rows() {
+        let rows = "aaa 100\nbbb 300\nccc notanumber\nno-space\nddd 200\n";
+        assert_eq!(newest_first(rows), ["bbb", "ddd", "aaa", "ccc"]);
+    }
+
+    #[test]
+    fn split_batch_keeps_request_order_across_hits_and_misses() {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"0123 blob 5\nhello\n");
+        out.extend_from_slice(b"deadbeef:m missing\n");
+        out.extend_from_slice(b"4567 blob 0\n\n");
+        assert_eq!(
+            split_batch(&out),
+            [Some("hello".to_string()), None, Some(String::new())]
+        );
+    }
+
+    #[test]
+    fn split_batch_stops_at_truncated_content() {
+        let out = b"0123 blob 5\nhel";
+        assert!(split_batch(out).is_empty());
+    }
 }
