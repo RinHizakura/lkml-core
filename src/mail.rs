@@ -174,6 +174,27 @@ impl Mail {
     /// Render the mail as plain text: a fixed set of headers followed by the
     /// decoded body. Used by the reader's detail view and the digest full format.
     pub fn render_full(&self) -> String {
+        self.render_with(&self.body())
+    }
+
+    /// [`render_full`](Self::render_full) with the body cut at its first
+    /// `diff --git` line, so a patch mail keeps its description and drops its
+    /// hunks. A cover letter or a reply has no such line and renders whole;
+    /// a quoted diff in a reply starts with `> ` and does not count.
+    pub fn render_without_diff(&self) -> String {
+        let body = self.body();
+        let cut = if body.starts_with("diff --git ") {
+            Some(0)
+        } else {
+            body.find("\ndiff --git ").map(|at| at + 1)
+        };
+        match cut {
+            Some(at) => self.render_with(&format!("{}[diff omitted]\n", &body[..at])),
+            None => self.render_with(&body),
+        }
+    }
+
+    fn render_with(&self, body: &str) -> String {
         let (headers, _) = split_headers(&self.raw);
 
         let mut out = String::new();
@@ -186,12 +207,12 @@ impl Mail {
             }
         }
         out.push_str("\n--\n\n");
-        out.push_str(&self.body());
+        out.push_str(body);
         out
     }
 
     /// The body, decoded according to `Content-Transfer-Encoding`.
-    fn body(&self) -> String {
+    pub fn body(&self) -> String {
         let (headers, body) = split_headers(&self.raw);
         let encoding = parse_header(headers, "Content-Transfer-Encoding")
             .unwrap_or_default()
@@ -517,4 +538,35 @@ fn decode_q(s: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    fn mail(body: &str) -> Mail {
+        Mail::new(
+            format!("From: a@b\nSubject: [PATCH] x\n\n{body}"),
+            0,
+            String::new(),
+        )
+    }
+
+    #[test]
+    fn without_diff_cuts_at_the_first_hunk_only() {
+        let m = mail("Fix it.\n---\ndiff --git a/x b/x\n+new\n");
+        let text = m.render_without_diff();
+        assert!(text.ends_with("Fix it.\n---\n[diff omitted]\n"), "{text}");
+        assert!(m.render_full().contains("+new"));
+    }
+
+    #[test]
+    fn without_diff_leaves_quoted_and_diffless_bodies_alone() {
+        let reply = mail("> diff --git a/x b/x\nLooks fine.\n");
+        assert_eq!(reply.render_without_diff(), reply.render_full());
+        let bare = mail("diff --git a/x b/x\n+new\n");
+        assert!(bare
+            .render_without_diff()
+            .ends_with("\n--\n\n[diff omitted]\n"));
+    }
 }
